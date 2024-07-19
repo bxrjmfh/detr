@@ -66,7 +66,7 @@ class BackboneBase(nn.Module):
             return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
         else:
             return_layers = {'layer4': "0"}
-        self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
+        self.body = IntermediateLayerGetter(backbone, return_layers=return_layers) # 取出指定层计算权重
         self.num_channels = num_channels
 
     def forward(self, tensor_list: NestedTensor):

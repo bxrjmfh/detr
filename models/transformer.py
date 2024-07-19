@@ -47,16 +47,32 @@ class Transformer(nn.Module):
     def forward(self, src, mask, query_embed, pos_embed):
         # flatten NxCxHxW to HWxNxC
         bs, c, h, w = src.shape
+        # src.shape = [bs, hidden_dim, h, w]
         src = src.flatten(2).permute(2, 0, 1)
-        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
+        # after flatten: [bs, hidden_dim, h*w]
+        # after permute: [h*w, bs, hidden_dim]
+        pos_embed = pos_embed.flatten(2).permute(2, 0, 1) # same.
         query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+        # query_embed.shape = [num_queries, hidden_dim]
+        # after unsqueeze: [num_queries, bs, hidden_dim]
         mask = mask.flatten(1)
 
         tgt = torch.zeros_like(query_embed)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        # 事实上编码器是自注意力驱动的，没有别的代价，得到的结果还是这样
+        # 经过了 self.attention 和 linear 层
+        # memory.shape = [bs, hidden_dim, h*w]
+        
+        
         hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed)
+        # 进行decode
+        # 注意decode 过程中 query_embed 作为 query_pos 输入
+        # 而 target 本身是一个零向量
+        # 所以 hs.shape = [n_layers, num_queries, bs, hidden_dim]
         return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w)
+        # 【1】shape = [n_layers, bs, num_queries, hidden_dim]
+        # 【2】shape = [bs, hidden_dim, h, w]
 
 
 class TransformerEncoder(nn.Module):
@@ -111,6 +127,8 @@ class TransformerDecoder(nn.Module):
                            pos=pos, query_pos=query_pos)
             if self.return_intermediate:
                 intermediate.append(self.norm(output))
+                # 记录每一个 decoder 的结果
+                # intermediate.shape = [num_layers, bs, num_queries, hidden_dim]
 
         if self.norm is not None:
             output = self.norm(output)
@@ -152,8 +170,12 @@ class TransformerEncoderLayer(nn.Module):
                      src_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None):
         q = k = self.with_pos_embed(src, pos)
+        # q = k 
+        # shape = [w*h, bs, hidden_dim]
         src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
                               key_padding_mask=src_key_padding_mask)[0]
+        # shape = [w*h, bs, hidden_dim]
+        
         src = src + self.dropout1(src2)
         src = self.norm1(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
@@ -217,14 +239,21 @@ class TransformerDecoderLayer(nn.Module):
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None):
         q = k = self.with_pos_embed(tgt, query_pos)
+        # query_pos.shape = [num_queries, bs, hidden_dim]
         tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
-                              key_padding_mask=tgt_key_padding_mask)[0]
+                              key_padding_mask=tgt_key_padding_mask)[0] # 计算的时候不传入q的mask，没有必要
+        # tgt2.shape = [num_queries, bs, hidden_dim]
+        
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
         tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
                                    key=self.with_pos_embed(memory, pos),
                                    value=memory, attn_mask=memory_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
+        # 这里的键是q，k和v都是memory
+        # 记忆信息被加权得到，最后保留每一个q的相关内容。
+        # tgt2.shape = [num_queries, bs, hidden_dim]
+        
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))

@@ -72,12 +72,15 @@ class PositionEmbeddingLearned(nn.Module):
         pos = torch.cat([
             x_emb.unsqueeze(0).repeat(h, 1, 1),
             y_emb.unsqueeze(1).repeat(1, w, 1),
-        ], dim=-1).permute(2, 0, 1).unsqueeze(0).repeat(x.shape[0], 1, 1, 1)
+        ], dim=-1).permute(2, 0, 1).unsqueeze(0).repeat(x.shape[0], 1, 1, 1) 
+        # (h, w, 2*N_steps)
+        # after permute: (2*N_steps, h, w)
+        # uns: (1, 2*N_steps, h, w) ; repeat: (B, 2*N_steps, h, w)
         return pos
 
 
 def build_position_encoding(args):
-    N_steps = args.hidden_dim // 2
+    N_steps = args.hidden_dim // 2 # 为什么是 hidden_dim // 2
     if args.position_embedding in ('v2', 'sine'):
         # TODO find a better way of exposing other arguments
         position_embedding = PositionEmbeddingSine(N_steps, normalize=True)

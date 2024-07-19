@@ -59,13 +59,20 @@ class DETR(nn.Module):
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
-
-        src, mask = features[-1].decompose()
+        # features [bs,n_fea,w,h] 
+        # pos:  (B, 2*N_steps, h, w) 每个 N_steps 都代表w/h 方向的位置编码
+        src, mask = features[-1].decompose() # 取出最后一层
         assert mask is not None
         hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
+        # 这里的 query_embed.weight 的是一个可学习的参数。!
+        # [Why use nn.Embedding for object query in the first decoder layer? · Issue #225 · facebookresearch/detr](https://github.com/facebookresearch/detr/issues/225)
+        # 【1】shape = [n_layers, bs, num_queries, hidden_dim]
+        # 【2】shape = [bs, hidden_dim, h, w]
 
         outputs_class = self.class_embed(hs)
+        # [n_layers, bs, num_queries, class+1]
         outputs_coord = self.bbox_embed(hs).sigmoid()
+        # 使用 sigmoid 来控制坐标在0-1之间
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
@@ -113,12 +120,41 @@ class SetCriterion(nn.Module):
         src_logits = outputs['pred_logits']
 
         idx = self._get_src_permutation_idx(indices)
+        # targets：[{'labels': tensor([1, 2, 3], 'bbxs' ：xx },
+        #           {...},
+        #           {...},
+        #            ...] 每个框都有对应的标签信息
+        # indices 是一个包含匹配结果的列表，用于指示预测框与目标框之间的最佳对应关系。
+        # 每个元素是一个元组 (src, tgt)，分别表示预测框和目标框的索引。
+        # 例如：
+        # indices = [
+        #     (torch.tensor([0, 1, 2]), torch.tensor([1, 0, 2])),  # 批次0的匹配结果
+        #     (torch.tensor([0, 1, 2]), torch.tensor([2, 1, 0]))   # 批次1的匹配结果
+        # ]
+        
+        # idx 是一个元组 (batch_idx, src_idx)，用来指定 target_classes 张量中需要替换的元素的位置。具体来说：
+        # batch_idx: 表示每个样本的批次索引，形状为 [num_matches]。
+        # src_idx: 表示每个目标框在预测框中的索引，形状为 [num_matches]。
+        
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        # 真实标签
+        # target_classes_o：[num_matches] = sum(len(t["labels"]) for t in targets)
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
+        # src_logits.shape: [batch_size, num_queries, num_classes + 1]
+        # target_classes：[batch_size, num_queries]
+        
         target_classes[idx] = target_classes_o
+        # idx 相当于 ([xs],[ys]) 分别代表 batch_id 和 pred_id 对应的放上正确的值
+        
 
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        # src_logits.transpose(1, 2) -> [bs, num_classes, num_queries]
+        # target_classes：[batch_size, num_queries]
+        # F.cross_entropy 函数通过检查输入张量的形状来确定哪些是 logits，哪些是目标类别。
+        # 它期望 logits 的形状为 [batch_size, num_classes, *]，
+        # 目标类别的形状为 [batch_size, *]，其中 * 表示任意数量的附加维度。
+        # 如果 logits 的类别数维度不在第二个位置，我们需要通过转置或其他方式来调整维度，以确保类别数维度在正确的位置。
         losses = {'loss_ce': loss_ce}
 
         if log:
@@ -131,12 +167,24 @@ class SetCriterion(nn.Module):
         """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
         This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
         """
+        # targets：[{'labels': tensor([1, 2, 3], 'bbxs' ：xx },
+        #           {...},
+        #           {...},
+        #            ...] 每个框都有对应的标签信息
+        
         pred_logits = outputs['pred_logits']
+        # pred_logits.shape: [batch_size, num_queries, num_classes]
         device = pred_logits.device
         tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
         # Count the number of predictions that are NOT "no-object" (which is the last class)
+        # tgt_lengths：[batch_size] = (len(t["labels"] for t in targets)
         card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
+        # pred_logits.argmax(-1) -> [batch_size,queries_num] 预测类别
+        # pred_logits.shape[-1] - 1 = num_classes - 1
+        # sum(1) 之后，标记为非背景类的计数。 
+        
         card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
+        # 数量的绝对值进行计算。
         losses = {'cardinality_error': card_err}
         return losses
 
@@ -147,9 +195,15 @@ class SetCriterion(nn.Module):
         """
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
+        # idx 是一个元组 (batch_idx, src_idx)，具体来说：
+        # batch_idx: 表示每个样本的批次索引，形状为 [num_matches]。
+        # src_idx: 表示每个目标框在预测框中的索引，形状为 [num_matches]。
         src_boxes = outputs['pred_boxes'][idx]
+        # 输出的 bbx
+        # src_boxes.shape: [num_matches, 4]
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-
+        # 取出所有真框
+        # target_boxes.shape: [num_matches, 4]
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
 
         losses = {}
@@ -159,6 +213,7 @@ class SetCriterion(nn.Module):
             box_ops.box_cxcywh_to_xyxy(src_boxes),
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
         losses['loss_giou'] = loss_giou.sum() / num_boxes
+        # 计算 GIOU 损失
         return losses
 
     def loss_masks(self, outputs, targets, indices, num_boxes):
@@ -195,7 +250,14 @@ class SetCriterion(nn.Module):
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
-
+        # 假设我们有一个批次大小为2的模型输出，其中每个批次有3个预测框。假设 indices 为：
+        # indices = [
+        #     (torch.tensor([0, 1, 2]), torch.tensor([0, 1, 2])),  # 批次0中的预测框索引和目标框索引
+        #     (torch.tensor([0, 1, 2]), torch.tensor([0, 1, 2]))   # 批次1中的预测框索引和目标框索引
+        # ]
+        # batch_idx 将生成 [0, 0, 0, 1, 1, 1]，表示预测框的批次索引。
+        # src_idx 将生成 [0, 1, 2, 0, 1, 2]，表示每个预测框的具体位置。
+        # 这些索引在后续计算中用于将预测结果与真实标签对齐，从而计算损失和评估模型性能。
     def _get_tgt_permutation_idx(self, indices):
         # permute targets following indices
         batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
@@ -235,6 +297,7 @@ class SetCriterion(nn.Module):
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+            # 逐步计算各个的loss
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
